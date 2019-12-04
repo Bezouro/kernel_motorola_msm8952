@@ -43,6 +43,8 @@
 
 static char verifiedbootstate[VERITY_COMMANDLINE_PARAM_LENGTH];
 static char veritymode[VERITY_COMMANDLINE_PARAM_LENGTH];
+static char veritykeyid[VERITY_DEFAULT_KEY_ID_LENGTH];
+static char buildvariant[BUILD_VARIANT];
 
 static bool target_added;
 static bool verity_enabled = true;
@@ -63,6 +65,7 @@ static struct target_type android_verity_target = {
 	.io_hints               = verity_io_hints,
 };
 
+#ifndef MODULE
 static int __init verified_boot_state_param(char *line)
 {
 	strlcpy(verifiedbootstate, line, sizeof(verifiedbootstate));
@@ -78,6 +81,48 @@ static int __init verity_mode_param(char *line)
 }
 
 __setup("androidboot.veritymode=", verity_mode_param);
+
+static int __init verity_keyid_param(char *line)
+{
+	strlcpy(veritykeyid, line, sizeof(veritykeyid));
+	return 1;
+}
+
+__setup("veritykeyid=", verity_keyid_param);
+
+static int __init verity_buildvariant(char *line)
+{
+	strlcpy(buildvariant, line, sizeof(buildvariant));
+	return 1;
+}
+
+__setup("buildvariant=", verity_buildvariant);
+#endif
+
+static inline bool default_verity_key_id(void)
+{
+	return veritykeyid[0] != '\0';
+}
+
+static inline bool is_eng(void)
+{
+	return 1;
+}
+
+static inline bool is_userdebug(void)
+{
+	static const char typeuserdebug[]  = "userdebug";
+
+	return !strncmp(buildvariant, typeuserdebug, sizeof(typeuserdebug));
+}
+
+static inline bool is_unlocked(void)
+{
+	static const char unlocked[] = "orange";
+
+	return !strncmp(verifiedbootstate, unlocked, sizeof(unlocked));
+}
+
 
 static int table_extract_mpi_array(struct public_key_signature *pks,
 				const void *data, size_t len)
@@ -248,7 +293,7 @@ static int extract_fec_header(dev_t dev, struct fec_header *fec,
 
 	bdev = blkdev_get_by_dev(dev, FMODE_READ, NULL);
 
-	if (IS_ERR(bdev)) {
+	if (IS_ERR_OR_NULL(bdev)) {
 		DMERR("bdev get error");
 		return PTR_ERR(bdev);
 	}
@@ -309,6 +354,24 @@ static void find_metadata_offset(struct fec_header *fec,
 		*metadata_offset = device_size - VERITY_METADATA_SIZE;
 }
 
+static int find_size(dev_t dev, u64 *device_size)
+{
+	struct block_device *bdev;
+
+	bdev = blkdev_get_by_dev(dev, FMODE_READ, NULL);
+	if (IS_ERR_OR_NULL(bdev)) {
+		DMERR("blkdev_get_by_dev failed");
+		return PTR_ERR(bdev);
+	}
+
+	*device_size = i_size_read(bdev->bd_inode);
+	*device_size >>= SECTOR_SHIFT;
+
+	DMINFO("blkdev size in sectors: %llu", *device_size);
+	blkdev_put(bdev, FMODE_READ);
+	return 0;
+}
+
 static struct android_metadata *extract_metadata(dev_t dev,
 				struct fec_header *fec)
 {
@@ -323,7 +386,7 @@ static struct android_metadata *extract_metadata(dev_t dev,
 
 	bdev = blkdev_get_by_dev(dev, FMODE_READ, NULL);
 
-	if (IS_ERR(bdev)) {
+	if (IS_ERR_OR_NULL(bdev)) {
 		DMERR("blkdev_get_by_dev failed");
 		return ERR_CAST(bdev);
 	}
@@ -451,19 +514,6 @@ const char *find_dt_value(const char *name)
 	return value;
 }
 
-static bool is_unlocked(void)
-{
-	static const char unlocked[]  = "orange";
-	static const char verified_boot_prop[] = "verifiedbootstate";
-	const char *value;
-
-	value = find_dt_value(verified_boot_prop);
-	if (!value)
-		value = verifiedbootstate;
-
-	return !strncmp(value, unlocked, sizeof(unlocked) - 1);
-}
-
 static int verity_mode(void)
 {
 	static const char enforcing[] = "enforcing";
@@ -483,7 +533,7 @@ static int verify_header(struct android_metadata_header *header)
 {
 	int retval = -EINVAL;
 
-	if (is_unlocked() && le32_to_cpu(header->magic_number) ==
+	if (is_userdebug() && le32_to_cpu(header->magic_number) ==
 		VERITY_METADATA_MAGIC_DISABLE) {
 		retval = VERITY_STATE_DISABLE;
 		return retval;
@@ -584,6 +634,8 @@ static int add_as_linear_device(struct dm_target *ti, char *dev)
 	android_verity_target.iterate_devices = dm_linear_iterate_devices,
 	android_verity_target.io_hints = NULL;
 
+	set_disk_ro(dm_disk(dm_table_get_md(ti->table)), 0);
+
 	err = dm_linear_ctr(ti, DM_LINEAR_ARGS, linear_table_args);
 
 	if (!err) {
@@ -593,6 +645,28 @@ static int add_as_linear_device(struct dm_target *ti, char *dev)
 		DMERR("Failed to add android-verity as linear target");
 
 	return err;
+}
+
+	static int create_linear_device(struct dm_target *ti, dev_t dev,
+				char *target_device)
+{
+	u64 device_size = 0;
+	int err = find_size(dev, &device_size);
+
+	if (err) {
+		DMERR("error finding bdev size");
+		handle_error();
+		return err;
+	}
+
+	ti->len = device_size;
+	err = add_as_linear_device(ti, target_device);
+	if (err) {
+		handle_error();
+		return err;
+	}
+	verity_enabled = false;
+	return 0;
 }
 
 /*
@@ -608,7 +682,7 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	dev_t uninitialized_var(dev);
 	struct android_metadata *uninitialized_var(metadata);
 	int err = 0, i, mode;
-	char *key_id = NULL, *table_ptr, dummy,
+	char *key_id = NULL, *table_ptr, dummy, *target_device,
 	*verity_table_args[VERITY_TABLE_ARGS + 2 + VERITY_TABLE_OPT_FEC_ARGS];
 	/* One for specifying number of opt args and one for mode */
 	sector_t data_sectors;
@@ -619,24 +693,50 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	char buf[FEC_ARG_LENGTH], *buf_ptr;
 	unsigned long long tmpll;
 
-	if (argc != 2) {
+	if (argc == 1) {
+	/* Use the default keyid */
+		if (default_verity_key_id())
+			key_id = veritykeyid;
+		else if (!is_eng()) {
+			DMERR("veritykeyid= is not set");
+			handle_error();
+			return -EINVAL;
+		}
+	} else if (argc == 2)
+		key_id = argv[1];
+	else {
 		DMERR("Incorrect number of arguments");
 		handle_error();
 		return -EINVAL;
 	}
 
-	/* should come as one of the arguments for the verity target */
-	key_id = argv[0];
-	strreplace(argv[0], '#', ' ');
+	target_device = argv[0];
 
-	dev = name_to_dev_t(argv[1]);
+	dev = name_to_dev_t(target_device);
 	if (!dev) {
-		DMERR("no dev found for %s", argv[1]);
-		handle_error();
-		return -EINVAL;
+		const unsigned int timeout_ms = DM_VERITY_WAIT_DEV_TIMEOUT_MS;
+		unsigned int wait_time_ms = 0;
+
+		DMERR("android_verity_ctr: retry %s\n", target_device);
+		while (driver_probe_done() != 0 ||
+			(dev = name_to_dev_t(target_device)) == 0) {
+			msleep(100);
+			wait_time_ms += 100;
+			if (wait_time_ms > timeout_ms) {
+				DMERR("android_verity_ctr: retry timeout(%dms)\n", timeout_ms);
+				DMERR("no dev found for %s", target_device);
+				handle_error();
+				return -EINVAL;
+			}
+		}
 	}
 
-	DMINFO("key:%s dev:%s", argv[0], argv[1]);
+	if (is_eng())
+		return create_linear_device(ti, dev, target_device);
+
+	strreplace(key_id, '#', ' ');
+
+	DMINFO("key:%s dev:%s", key_id, target_device);
 
 	if (extract_fec_header(dev, &fec, &ecc)) {
 		DMERR("Error while extracting fec header");
@@ -667,7 +767,7 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto free_metadata;
 	}
 
-	if (!verity_enabled) {
+	if (verity_enabled) {
 		err = verify_verity_signature(key_id, metadata);
 
 		if (err) {
@@ -734,30 +834,33 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	/* Setup linear target and free */
 	if (!verity_enabled) {
-		err = add_as_linear_device(ti, argv[1]);
+		err = add_as_linear_device(ti, target_device);
 		goto free_metadata;
 	}
 
 	/*substitute data_dev and hash_dev*/
-	verity_table_args[1] = argv[1];
-	verity_table_args[2] = argv[1];
+	verity_table_args[1] = target_device;
+	verity_table_args[2] = target_device;
 
 	mode = verity_mode();
 
 	if (ecc.valid && IS_BUILTIN(CONFIG_DM_VERITY_FEC)) {
 		if (mode) {
-			err = snprintf(buf, FEC_ARG_LENGTH,
-			"%u %s " VERITY_TABLE_OPT_FEC_FORMAT,
-			1 + VERITY_TABLE_OPT_FEC_ARGS,
-			mode == DM_VERITY_MODE_RESTART ?
-			VERITY_TABLE_OPT_RESTART : VERITY_TABLE_OPT_LOGGING,
-			argv[1], ecc.start / FEC_BLOCK_SIZE, ecc.blocks,
-			ecc.roots);
+		err = snprintf(buf, FEC_ARG_LENGTH,
+		"%u %s " VERITY_TABLE_OPT_FEC_FORMAT,
+				1 + VERITY_TABLE_OPT_FEC_ARGS,
+				mode == DM_VERITY_MODE_RESTART ?
+					VERITY_TABLE_OPT_RESTART :
+					VERITY_TABLE_OPT_LOGGING,
+				target_device,
+				ecc.start / FEC_BLOCK_SIZE, ecc.blocks,
+				ecc.roots);
 		} else {
 			err = snprintf(buf, FEC_ARG_LENGTH,
 			"%u " VERITY_TABLE_OPT_FEC_FORMAT,
-			VERITY_TABLE_OPT_FEC_ARGS, argv[1],
-			ecc.start / FEC_BLOCK_SIZE, ecc.blocks, ecc.roots);
+			VERITY_TABLE_OPT_FEC_ARGS, target_device,
+			ecc.start / FEC_BLOCK_SIZE, ecc.blocks,
+			ecc.roots);
 		}
 	} else if (mode) {
 		err = snprintf(buf, FEC_ARG_LENGTH,
